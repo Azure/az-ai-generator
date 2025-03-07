@@ -1,3 +1,13 @@
+"""
+Utility module for Azure AI Accelerator application.
+
+This module provides helper functions for:
+- Environment configuration
+- OpenTelemetry setup for observability (tracing, metrics, and logging)
+- Agent creation from YAML definitions
+- Workflow utilities for agent interactions
+"""
+
 from io import StringIO
 from subprocess import run, PIPE
 import os
@@ -45,6 +55,12 @@ from semantic_kernel.functions import KernelArguments
 from semantic_kernel.agents import ChatCompletionAgent
 
 def load_dotenv_from_azd():
+    """
+    Loads environment variables from Azure Developer CLI (azd) or .env file.
+    
+    Attempts to load environment variables using the azd CLI first. 
+    If that fails, falls back to loading from a .env file in the current directory.
+    """
     result = run("azd env get-values", stdout=PIPE, stderr=PIPE, shell=True, text=True)
     if result.returncode == 0:
         logging.info(f"Found AZD environment. Loading...")
@@ -61,6 +77,9 @@ local_endpoint = None
 
 
 def set_up_tracing():
+    """
+    Sets up exporters for Azure Monitor and optional local telemetry.
+    """
     exporters = []
     exporters.append(AzureMonitorTraceExporter.from_connection_string(os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING")))
     if (local_endpoint):
@@ -73,6 +92,10 @@ def set_up_tracing():
 
 
 def set_up_metrics():
+    """
+    Configures metrics collection with OpenTelemetry.
+    Configures views to filter metrics to only those starting with "semantic_kernel".
+    """
     exporters = []
     if (local_endpoint):
         exporters.append(OTLPMetricExporter(endpoint=local_endpoint))
@@ -93,6 +116,10 @@ def set_up_metrics():
 
 
 def set_up_logging():
+    """
+    Configures logging with OpenTelemetry.
+    Adds filters to exclude specific namespace logs for cleaner output.
+    """
     exporters = []
     exporters.append(AzureMonitorLogExporter(connection_string=os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING")))
 
@@ -114,8 +141,11 @@ def set_up_logging():
 
     # FILTER - WHAT NOT TO LOG
     class KernelFilter(logging.Filter):
-        """A filter to not process records from semantic_kernel."""
-
+        """
+        A filter to exclude logs from specific semantic_kernel namespaces.
+        
+        Prevents excessive logging from specified module namespaces to reduce noise.
+        """
         # These are the namespaces that we want to exclude from logging for the purposes of this demo.
         namespaces_to_exclude: list[str] = [
             # "semantic_kernel.functions.kernel_plugin",
@@ -136,29 +166,81 @@ def set_up_logging():
 # UTILITY - CREATES an agent based on YAML definition
 # --------------------------------------------
 def create_agent_from_yaml(kernel, service_id, definition_file_path, reasoning_effort=None):
+    """
+    Creates a ChatCompletionAgent from a YAML definition file.
+    
+    Args:
+        kernel: The Semantic Kernel instance
+        service_id: The service ID to use for the agent
+        definition_file_path: Path to the YAML file containing agent definition
+        reasoning_effort: Optional reasoning effort parameter for OpenAI models
+        
+    Returns:
+        ChatCompletionAgent: Configured agent instance
+        
+    The YAML definition should include name, description, instructions, 
+    temperature, and included_plugins.
+    """
+        
+    with open(definition_file_path, 'r', encoding='utf-8') as file:
+        definition = yaml.safe_load(file)
+        
+    settings = AzureChatPromptExecutionSettings(
+            temperature=definition.get('temperature', 0.5),
+            function_choice_behavior=FunctionChoiceBehavior.Auto(
+                filters={"included_plugins": definition.get('included_plugins', [])}
+            ))
 
-        with open(definition_file_path, 'r', encoding='utf-8') as file:
-            definition = yaml.safe_load(file)
-
-        settings = AzureChatPromptExecutionSettings(
-                temperature=definition.get('temperature', 0.5),
-                function_choice_behavior=FunctionChoiceBehavior.Auto(
-                    filters={"included_plugins": definition.get('included_plugins', [])}
-                ))
-
-        # Resoning model specifics
-        model_id = kernel.get_service(service_id=service_id).ai_model_id
-        if model_id.lower().startswith("o"):
-            settings.temperature = None
-            settings.reasoning_effort = reasoning_effort
-
-        agent = ChatCompletionAgent(
-            service_id=service_id,
-            kernel=kernel,
-            arguments=KernelArguments(settings=settings),
-            name=definition['name'],
-            description=definition['description'],
-            instructions=definition['instructions']
-        )
-
-        return agent
+    # Resoning model specifics
+    model_id = kernel.get_service(service_id=service_id).ai_model_id
+    if model_id.lower().startswith("o"):
+        settings.temperature = None
+        settings.reasoning_effort = reasoning_effort
+        
+    agent = ChatCompletionAgent(
+        service=kernel.get_service(service_id=service_id),
+        kernel=kernel,
+        arguments=KernelArguments(settings=settings),
+        name=definition['name'],
+        description=definition['description'],
+        instructions=definition['instructions']
+    )
+    
+    return agent
+    
+async def describe_next_action(kernel, settings, messages):
+    """
+    Determines the next action in an agent conversation workflow.
+    
+    Args:
+        kernel: The Semantic Kernel instance
+        settings: Execution settings for the prompt
+        messages: Conversation history between agents
+        
+    Returns:
+        str: A three-word summary of the next action, indicating which agent should act
+        
+    This function analyzes the conversation context to determine workflow progression
+    between WRITER and CRITIC agents, with special handling for high-scoring CRITIC responses.
+    """
+    next_action = await kernel.invoke_prompt(
+        function_name="describe_next_action",
+        prompt=f"""
+        Provided the following chat history, what is next action in the agentic chat? 
+        
+        Provide three word summary.
+        Always indicate WHO takes the action, for example: WRITER: Writes revises draft
+        OBS! CRITIC cannot take action, only to evaluate the text and provide a score.
+        
+        IF the last entry is from CRITIC and the score is above 8 - you MUST respond with "CRITIC: Approves the text."
+        
+        AGENTS:
+        - WRITER: Writes and revises the text
+        - CRITIC: Evaluates the text and provides scroring from 1 to 10
+        
+        AGENT_CHAT: {messages}
+        
+        """,
+        settings=settings
+    )
+    return next_action

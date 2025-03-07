@@ -78,6 +78,7 @@ const prompting = async function () {
     this.props.authorContact = `${this.props.creatorName} <${this.props.creatorEmail}>`;
     this.props.solutionPythonName = us.underscored(this.props.solutionSlug);
     this.props.solutionLevel = parseInt(this.props.solutionLevel);
+    this.props.solutionNameSlug = us.slugify(this.props.solutionName);
   });
 };
 

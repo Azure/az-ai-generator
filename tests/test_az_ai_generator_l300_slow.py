@@ -17,7 +17,7 @@ class TestAZAiGeneratorL300Slow:
 
     @pytest.mark.slow
     @pytest.mark.usefixtures("depend_on_fast", "azd_env")
-    def test_deployment_with_authentication(self, solution):
-        solution.run_in("azd env set WITH_AUTHENTICATION true")
+    def test_deployment_use_authentication(self, solution):
+        solution.run_in("azd env set USE_AUTHENTICATION true")
         solution.run_in("azd up --no-prompt")
 
