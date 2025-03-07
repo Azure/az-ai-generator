@@ -1,7 +1,9 @@
 import os
+import json
 import logging
 from typing import ClassVar
 import datetime
+from utils.util import describe_next_action
 
 from semantic_kernel.kernel import Kernel
 from semantic_kernel.agents import AgentGroupChat
@@ -24,14 +26,31 @@ from pydantic import Field
 from utils.util import create_agent_from_yaml
 
 
-# This patetrn demonstrates how a debate between equally skilled models
+# This pattern demonstrates how a debate between equally skilled models
 # can deliver an outcome that exceeds the capability of the model if 
 # the task is handled as a single request-response in its entirety. 
-# We focus each agent on the subset of the whole task and thus get better results.
+# We focus each agent on the subset of the whole task and thus 
+# get better results.
 class DebateOrchestrator:
+    """
+    Orchestrates a debate between AI agents to produce higher quality responses.
     
+    This class sets up and manages a conversation between Writer and Critic agents using
+    Semantic Kernel's Agent Group Chat functionality. The debate pattern improves response
+    quality by allowing specialized agents to focus on different aspects of the task.
+    """
+    
+    # --------------------------------------------
+    # Constructor
+    # --------------------------------------------
     def __init__(self):
-
+        """
+        Creates the DebateOrchestrator with necessary services and kernel configurations.
+        
+        Sets up Azure OpenAI connections for both executor and utility models, 
+        configures Semantic Kernel, and prepares execution settings for the agents.
+        """
+        
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
         self.logger.info("Semantic Orchestrator Handler init")
@@ -43,9 +62,11 @@ class DebateOrchestrator:
         executor_deployment_name = os.getenv("EXECUTOR_AZURE_OPENAI_DEPLOYMENT_NAME")
         utility_deployment_name = os.getenv("UTILITY_AZURE_OPENAI_DEPLOYMENT_NAME")
         
-        # planner_api_key = os.getenv("aoaikeysecret", None)
-        
         credential = DefaultAzureCredential()
+        
+        # Multi model setup - a service is an LLM in SK terms
+        # Executor - gpt-4o 
+        # Utility  - gpt-4o-mini
         executor_service = AzureAIInferenceChatCompletion(
             ai_model_id="executor",
             service_id="executor",
@@ -76,13 +97,19 @@ class DebateOrchestrator:
         self.settings_utility = AzureChatPromptExecutionSettings(service_id="utility", temperature=0)
         
         self.resourceGroup = os.getenv("AZURE_RESOURCE_GROUP")
-        
 
     # --------------------------------------------
     # Create Agent Group Chat
     # --------------------------------------------
     def create_agent_group_chat(self):
-
+        """
+        Creates and configures an agent group chat with Writer and Critic agents.
+        
+        Returns:
+            AgentGroupChat: A configured group chat with specialized agents, 
+                           selection strategy and termination strategy.
+        """
+        
         self.logger.debug("Creating chat")
         
         writer = create_agent_from_yaml(service_id="executor",
@@ -101,13 +128,83 @@ class DebateOrchestrator:
                                          maximum_iterations=6))
 
         return agent_group_chat
+        
+    # --------------------------------------------
+    # Run the agent conversation
+    # --------------------------------------------
+    async def process_conversation(self, user_id, conversation_messages):
+        """
+        Processes a conversation by orchestrating a debate between AI agents.
+        
+        Manages the entire conversation flow, from initializing the agent group chat to
+        collecting and returning responses. Uses OpenTelemetry for tracing.
+        
+        Args:
+            user_id: Unique identifier for the user, used in session tracking.
+            conversation_messages: List of dictionaries with role, name and content
+                                  representing the conversation history.
+                                  
+        Yields:
+            Status updates during processing and the final response in JSON format.
+        """
+        
+        agent_group_chat = self.create_agent_group_chat()
+       
+        # Load chat history
+        chat_history = [
+            ChatMessageContent(
+                role=AuthorRole(d.get('role')),
+                name=d.get('name'),
+                content=d.get('content')
+            ) for d in filter(lambda m: m['role'] in ("assistant", "user"), conversation_messages)
+        ]
 
+        await agent_group_chat.add_chat_messages(chat_history)
+
+        tracer = get_tracer(__name__)
+        
+        # UNIQUE SESSION ID is a must for AI Foundry Tracing
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+        session_id = f"{user_id}-{current_time}"
+        
+        messages = []
+        
+        with tracer.start_as_current_span(session_id):
+            yield "WRITER: Prepares the initial draft"
+            async for a in agent_group_chat.invoke():
+                self.logger.info("Agent: %s", a.to_dict())
+                messages.append(a.to_dict())
+                next_action = await describe_next_action(self.kernel, self.settings_utility, messages)
+                self.logger.info("%s", next_action)
+                # Returning plain text to indicate that it is a status update
+                yield f"{next_action}"
+
+        response = list(reversed([item async for item in agent_group_chat.get_chat_messages()]))
+
+        # Last writer response
+        reply = [r for r in response if r.name == "Writer"][-1].to_dict()
+        
+        # Final message is formatted as JSON to indicate the final response
+        yield json.dumps(reply)
+        
     # --------------------------------------------
     # Speaker Selection Strategy
     # --------------------------------------------
     # Using executor model since we need to process context - cognitive task
     def create_selection_strategy(self, agents, default_agent):
-        """Speaker selection strategy for the agent group chat."""
+        """
+        Creates a strategy to determine which agent speaks next in the conversation.
+        
+        Uses the executor model to analyze conversation context and select the most 
+        appropriate next speaker based on the conversation history.
+        
+        Args:
+            agents: List of available agents in the conversation.
+            default_agent: The fallback agent to use if selection fails.
+            
+        Returns:
+            KernelFunctionSelectionStrategy: A strategy for selecting the next speaker.
+        """
         definitions = "\n".join([f"{agent.name}: {agent.description}" for agent in agents])
         
         selection_function = KernelFunctionFromPrompt(
@@ -151,10 +248,17 @@ class DebateOrchestrator:
     # --------------------------------------------
     def create_termination_strategy(self, agents, maximum_iterations):
         """
-        Create a chat termination strategy that terminates when the Critic is satisfied
-        params:
-            agents: List of agents to trigger termination evaluation (critic only)
-            maximum_iterations: Maximum number of iterations before termination
+        Creates a strategy to determine when the debate should end.
+        
+        The strategy terminates the conversation when the Critic agent's evaluation 
+        score exceeds a threshold (8.0) or when maximum iterations are reached.
+        
+        Args:
+            agents: List of agents that can trigger termination evaluation.
+            maximum_iterations: Maximum number of conversation turns before forced termination.
+            
+        Returns:
+            CompletionTerminationStrategy: A strategy for determining when to end the debate.
         """
 
         # Using UTILITY model - the task is simple - evaluation score extraction
@@ -175,7 +279,7 @@ class DebateOrchestrator:
                 """)
 
             async def should_agent_terminate(self, agent, history):
-                """Terminate if the evaluation score is more then the passing score."""
+                """Terminate if the evaluation score > the passing score."""
                 
                 self.iteration += 1
                 self.logger.info(f"Iteration: {self.iteration} of {self.maximum_iterations}")
@@ -198,36 +302,3 @@ class DebateOrchestrator:
 
         return CompletionTerminationStrategy(agents=agents,
                                              maximum_iterations=maximum_iterations)
-
-    async def process_conversation(self, user_id, conversation_messages):
-        agent_group_chat = self.create_agent_group_chat()
-       
-        # Load chat history
-        chat_history = [
-            ChatMessageContent(
-                role=AuthorRole(d.get('role')),
-                name=d.get('name'),
-                content=d.get('content')
-            ) for d in filter(lambda m: m['role'] in ("assistant", "user"), conversation_messages)
-        ]
-
-        await agent_group_chat.add_chat_messages(chat_history)
-
-        tracer = get_tracer(__name__)
-        
-        # UNIQUE SESSION ID is a must
-        current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-        session_id = f"{user_id}-{current_time}"
-        
-        with tracer.start_as_current_span(session_id):
-            # async for _ in agent_group_chat.invoke():
-                #     pass
-            async for a in agent_group_chat.invoke():
-                self.logger.info("Agent: %s", a)
-
-        response = list(reversed([item async for item in agent_group_chat.get_chat_messages()]))
-
-        # Writer response, as we run termination evaluation on Critic, ther last message will be from Critic
-        reply = [r for r in response if r.name == "Writer"][-1].to_dict()
-        
-        return reply
