@@ -102,7 +102,7 @@ with st.status("Agents are crafting a response...", expanded=True) as status:
         url = f'{os.getenv("BACKEND_ENDPOINT", "http://localhost:8000")}/blog'
         payload = {"topic": "cookies", "user_id": get_principal_id()}
         headers = {}
-        
+
 <% if (solutionLevel > 100) { -%>
         if not (url.startswith('http://localhost') or url.startswith('http://127.0.0.1')):
           token = DefaultAzureCredential().get_token(f'api://{app_id}/.default')
@@ -112,7 +112,7 @@ with st.status("Agents are crafting a response...", expanded=True) as status:
         # Each chunk can be be either a string or contain JSON. 
         # If the chunk is a string it is a status action update - "Critic evaluates the text". 
         # If it is a JSON it will contain the generated blog post content.
-        with requests.post(url, json=payload, headers={}, stream=True) as response:
+        with requests.post(url, json=payload, headers=headers, stream=True) as response:
             for line in response.iter_lines():
                 result = line.decode('utf-8')
                 # For each line as JSON
